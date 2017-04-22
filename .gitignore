@@ -1,0 +1,9 @@
+
+.*.sw*
+.depend
+_client
+_deps
+_server
+local
+gong_server.conf.in
+
