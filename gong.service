@@ -1,0 +1,24 @@
+
+##
+#
+# This is the systemd service file to auto-start
+# the gong server when the system boots
+#
+# Modify the path to ExecStart for your user, then
+# copy this file to /usr/lib/systemd/system, and
+# add a symlink in:
+#   /etc/systemd/system/multi-user.target.wants
+# for gong.service
+#
+##
+
+[Service]
+ExecStart=/home/alarm/gong/gong_server/gong_start
+User=alarm
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+
+

@@ -1,0 +1,24 @@
+#!/bin/bash
+
+##
+#
+# This is the start script for the gong.service
+# systemd service. The ExecStart line of the
+# systemd unit must point to this script.
+#
+##
+
+# modify this line to match your user/install location
+cd /home/alarm/gong/gong_server
+
+# In some cases if the system shuts down improperly,
+# this file will not be deleted and prevent the server
+# from booting successfully in the future.
+rm -f local/var/data/gong_server/ocsipersist/socket
+
+# make sure the ocaml environment is configured correctly
+# before attempting to run ocsigenserver
+eval `opam config env`
+
+make test.byte 2>&1 | tee gong.log
+
