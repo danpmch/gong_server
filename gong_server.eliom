@@ -13,34 +13,34 @@ module type GONG =
 sig
    type t
 
-   val connect : unit -> t Lwt.t
+   val connect : string -> t Lwt.t
    val reconnect : t -> unit Lwt.t
 
    val ring : t -> unit Lwt.t
 end
-
-module type FILENAME = sig val filename: string end
 
 (**
  * Allows treating a file as a gong. The real
  * gong is accessed through the device file for the
  * arduino, which on my system is usually /dev/ttyACM0
  *)
-module FileGong(Filename : FILENAME) : GONG =
+module FileGong : GONG =
 struct
    (* the channel is stored in a ref to simplify reconnecting
     * after the arduino is unplugged or the test file is deleted *)
-   type t = Lwt_io.output Lwt_io.channel ref
+   type t = { filename: string
+            ; file: Lwt_io.output Lwt_io.channel ref }
 
-   let open_file () =
-     Lwt_io.open_file Lwt_io.Output Filename.filename
+   let open_file filename =
+     Lwt_io.open_file Lwt_io.Output filename
 
-   let connect () = 
-     open_file () >|= (fun file -> ref file)
+   let connect filename = 
+     open_file filename >|=
+        (fun file -> { filename = filename; file = ref file })
 
    let reconnect gong =
-      let old_file = !gong in
-      open_file () >|=
+      let old_file = !(gong.file) in
+      open_file gong.filename >|=
       (* I believe there's a race condition here. If two
        * threads are opening a new file simultaneously
        * then whichever one finishes last will throw away
@@ -49,12 +49,12 @@ struct
        * Should either use a mutex or figure out if
        * Ocaml/Lwt has a better technique.
        * *)
-      (fun file -> gong := file) >>=
+      (fun file -> gong.file := file) >>=
       (fun _ -> Lwt_io.close old_file)
 
    let ring gong : unit Lwt.t =
-     Lwt_io.write_char !gong 'g' >>=
-     (fun _ -> Lwt_io.flush !gong)
+     Lwt_io.write_char !(gong.file) 'g' >>=
+     (fun _ -> Lwt_io.flush !(gong.file))
 
 end
 
@@ -83,17 +83,17 @@ struct
    type t = { gong: Gong.t
             ; mailbox: request Lwt_mvar.t }
 
-   let rec wait_for_connection connect_fn () =
+   let rec wait_for_connection (connect_fn: string -> 'a Lwt.t) filename () =
      Lwt.catch
        (fun () ->
-          connect_fn () >>=
+          connect_fn filename >>=
           (fun gong ->
             Lwt_io.printl "Connected to gong!" >|=
             (fun _ -> gong)))
        (fun _ ->
          Lwt_io.printl "Could not connect to gong, retrying..." >>=
          (fun _ -> Lwt_unix.sleep 5.0) >>=
-         wait_for_connection connect_fn)
+         wait_for_connection connect_fn filename)
 
    let gong server : unit Lwt.t =
      Lwt_io.printl "Processing gong request" >>=
@@ -108,13 +108,13 @@ struct
        (function Ring -> gong server
                | Reconnect ->
                   Lwt_io.printl "Reconnecting to gong..." >>=
-                  (wait_for_connection (fun () -> Gong.reconnect server.gong))) >>=
+                  (wait_for_connection (fun _ -> Gong.reconnect server.gong) "")) >>=
        (process_requests server)
 
-   let create () : (unit -> unit Lwt.t) * request Lwt_mvar.t  =
+   let create filename : (unit -> unit Lwt.t) * request Lwt_mvar.t  =
       let mailbox = Lwt_mvar.create_empty () in
       let server_task () =
-         wait_for_connection Gong.connect () >|=
+         wait_for_connection Gong.connect filename () >|=
          (fun gong ->
            let server = { gong = gong;
               mailbox = mailbox } in
@@ -132,10 +132,8 @@ struct
 
 end
 
-module ArduinoGong = FileGong(struct let filename = "/dev/ttyACM0" end)
-module TestGong = FileGong(struct let filename = "gong.txt" end)
-module AudibleTestGong = WithTerminalBell(TestGong)
-module Server = GongServer(ArduinoGong)
+module GongWithTerminalBell = WithTerminalBell(FileGong)
+module Server = GongServer(FileGong)
 
 module Server_app =
   Eliom_registration.App (
@@ -173,7 +171,7 @@ let serve mailbox =
     (fun () () -> Lwt_mvar.put mailbox Server.Reconnect)
 
 let () =
-   let gong_server, mailbox = Server.create () in
+   let gong_server, mailbox = Server.create "/dev/ttyACM0" in
    Lwt.async gong_server;
    serve mailbox
 
