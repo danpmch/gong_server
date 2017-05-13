@@ -9,64 +9,126 @@
   open Lwt
 ]
 
-module type GONG_SERVER =
+module type GONG =
 sig
    type t
 
-   val connect : string -> t Lwt.t
-   val reconnect: t -> unit Lwt.t
+   val connect : unit -> t Lwt.t
+   val reconnect : t -> unit Lwt.t
 
-   val request_gong : t -> unit Lwt.t
+   val ring : t -> unit Lwt.t
 end
 
-module Arduino : GONG_SERVER =
+module type FILENAME = sig val filename: string end
+
+(**
+ * Allows treating a file as a gong. The real
+ * gong is accessed through the device file for the
+ * arduino, which on my system is always /dev/ttyACM0
+ *)
+module FileGong(Filename : FILENAME) : GONG =
 struct
-   type t = { filename: string
-            ; device_file: Lwt_io.output Lwt_io.channel ref
+   (* the channel is stored in a ref to simplify reconnecting
+    * after the arduino is unplugged or the test file is deleted *)
+   type t = Lwt_io.output Lwt_io.channel ref
+
+   let open_file () =
+     Lwt_io.open_file Lwt_io.Output Filename.filename
+
+   let connect () = 
+     open_file () >|= (fun file -> ref file)
+
+   let reconnect gong =
+      let old_file = !gong in
+      open_file () >|=
+      (* I believe there's a race condition here. If two
+       * threads are opening a new file simultaneously
+       * then whichever one finishes last will throw away
+       * the first thread's file without closing it.
+       *
+       * Should either use a mutex or figure out if
+       * Ocaml/Lwt has a better technique.
+       * *)
+      (fun file -> gong := file) >>=
+      (fun _ -> Lwt_io.close old_file)
+
+   let ring gong : unit Lwt.t =
+     Lwt_io.write_char !gong 'g' >>=
+     (fun _ -> Lwt_io.flush !gong)
+
+end
+
+(**
+ * Given a gong, creates a new gong that behaves the same
+ * as the original gong, but also plays the system bell when
+ * the ring function is called
+ *)
+module WithTerminalBell(Gong : GONG) : GONG =
+struct
+   type t = Gong.t
+
+   let connect = Gong.connect
+   let reconnect = Gong.reconnect
+   let ring gong =
+      Gong.ring gong >>=
+      (fun _ -> Lwt_io.print "\007")
+
+end
+
+module GongServer(Gong : GONG) =
+struct
+   type t = { gong: Gong.t
             ; mailbox: unit Lwt_mvar.t }
 
-   let rec open_file filename =
+   let rec wait_for_connection connect_fn () =
      Lwt.catch
        (fun () ->
-          Lwt_io.open_file Lwt_io.Output filename >>=
-          (fun file ->
-            Lwt_io.printl "Connected to arduino!" >|=
-            (fun _ -> file)))
+          connect_fn () >>=
+          (fun gong ->
+            Lwt_io.printl "Connected to gong!" >|=
+            (fun _ -> gong)))
        (fun _ ->
-         Lwt_io.printl "Could not connect to arduino, retrying..." >>=
+         Lwt_io.printl "Could not connect to gong, retrying..." >>=
          (fun _ -> Lwt_unix.sleep 5.0) >>=
-         (fun _ -> open_file filename))
+         wait_for_connection connect_fn)
 
-   let gong arduino () : unit Lwt.t =
+   let gong server () : unit Lwt.t =
      Lwt_io.printl "Processing gong request" >>=
-     (fun _ -> Lwt_io.write_char !(arduino.device_file) 'g') >>=
-     (fun _ -> Lwt_io.flush !(arduino.device_file))
+     (fun _ -> Gong.ring server.gong)
 
-   let rec process_requests arduino () =
-      Lwt_mvar.take arduino.mailbox >>=
-       (gong arduino) >>=
-       (process_requests arduino)
+     (* This function is responsible for pulling
+      * requests out of the mailbox and actually
+      * ringing the gong. It is intended to be run in
+      * a separate asynchronous thread *)
+   let rec process_requests server () =
+      Lwt_mvar.take server.mailbox >>=
+       (gong server) >>=
+       (process_requests server)
 
-   let connect filename =
-      open_file filename >|=
-      (fun file ->
-        let arduino = { filename = filename;
-           device_file = ref file;
+   let connect () =
+      wait_for_connection Gong.connect () >|=
+      (fun gong ->
+        let server = { gong = gong;
            mailbox = Lwt_mvar.create_empty () } in
-        Lwt.async (process_requests arduino);
-        arduino)
+        (* launch the request handling thread *)
+        Lwt.async (process_requests server);
+        server)
 
-   let request_gong arduino =
-      Lwt_mvar.put arduino.mailbox ()
+   (* this is the function called in response to 
+    * http requests to the gong endpoint *)
+   let request_gong server =
+      Lwt_mvar.put server.mailbox ()
 
-   let reconnect arduino =
-      let old_device = !(arduino.device_file) in
-      Lwt_io.printl "Reconnecting to Arduino..." >>=
-      (fun _ -> open_file arduino.filename) >|=
-      (fun file -> arduino.device_file := file) >>=
-      (fun _ -> Lwt_io.close old_device)
+   let reconnect server =
+      Lwt_io.printl "Reconnecting to gong..." >>=
+      (wait_for_connection (fun () -> Gong.reconnect server.gong))
 
 end
+
+module ArduinoGong = FileGong(struct let filename = "/dev/ttyACM0" end)
+module TestGong = FileGong(struct let filename = "gong.txt" end)
+module AudibleTestGong = WithTerminalBell(TestGong)
+module Server = GongServer(ArduinoGong)
 
 module Server_app =
   Eliom_registration.App (
@@ -87,11 +149,11 @@ let reconnect_service =
     ~meth:(Eliom_service.Get Eliom_parameter.unit)
     ()
 
-let serve arduino =
+let serve server =
   Server_app.register
     ~service:gong_service
     (fun () () ->
-      Arduino.request_gong arduino >|=
+      Server.request_gong server >|=
       (fun _ ->
         (Eliom_tools.F.html
            ~title:"gong"
@@ -101,8 +163,8 @@ let serve arduino =
            ]))));
   Eliom_registration.Action.register
     ~service:reconnect_service
-    (fun () () -> Arduino.reconnect arduino)
+    (fun () () -> Server.reconnect server)
 
 let () =
-  Arduino.connect "gong.txt" >|= serve |> Lwt_main.run
+   Server.connect () >|= serve |> Lwt_main.run
 
