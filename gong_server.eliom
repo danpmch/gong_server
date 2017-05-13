@@ -24,7 +24,7 @@ module type FILENAME = sig val filename: string end
 (**
  * Allows treating a file as a gong. The real
  * gong is accessed through the device file for the
- * arduino, which on my system is always /dev/ttyACM0
+ * arduino, which on my system is usually /dev/ttyACM0
  *)
 module FileGong(Filename : FILENAME) : GONG =
 struct
@@ -77,8 +77,11 @@ end
 
 module GongServer(Gong : GONG) =
 struct
+   type request = Ring
+                | Reconnect
+
    type t = { gong: Gong.t
-            ; mailbox: unit Lwt_mvar.t }
+            ; mailbox: request Lwt_mvar.t }
 
    let rec wait_for_connection connect_fn () =
      Lwt.catch
@@ -92,7 +95,7 @@ struct
          (fun _ -> Lwt_unix.sleep 5.0) >>=
          wait_for_connection connect_fn)
 
-   let gong server () : unit Lwt.t =
+   let gong server : unit Lwt.t =
      Lwt_io.printl "Processing gong request" >>=
      (fun _ -> Gong.ring server.gong)
 
@@ -102,26 +105,30 @@ struct
       * a separate asynchronous thread *)
    let rec process_requests server () =
       Lwt_mvar.take server.mailbox >>=
-       (gong server) >>=
+       (function Ring -> gong server
+               | Reconnect ->
+                  Lwt_io.printl "Reconnecting to gong..." >>=
+                  (wait_for_connection (fun () -> Gong.reconnect server.gong))) >>=
        (process_requests server)
 
-   let connect () =
-      wait_for_connection Gong.connect () >|=
-      (fun gong ->
-        let server = { gong = gong;
-           mailbox = Lwt_mvar.create_empty () } in
-        (* launch the request handling thread *)
-        Lwt.async (process_requests server);
-        server)
+   let create () : (unit -> unit Lwt.t) * request Lwt_mvar.t  =
+      let mailbox = Lwt_mvar.create_empty () in
+      let server_task () =
+         wait_for_connection Gong.connect () >|=
+         (fun gong ->
+           let server = { gong = gong;
+              mailbox = mailbox } in
+           (* launch the request handling thread *)
+           Lwt.async (process_requests server)) in
+      (server_task, mailbox)
 
    (* this is the function called in response to 
     * http requests to the gong endpoint *)
    let request_gong server =
-      Lwt_mvar.put server.mailbox ()
+      Lwt_mvar.put server.mailbox Ring
 
-   let reconnect server =
-      Lwt_io.printl "Reconnecting to gong..." >>=
-      (wait_for_connection (fun () -> Gong.reconnect server.gong))
+   let reconnect server : unit Lwt.t =
+      Lwt_mvar.put server.mailbox Reconnect
 
 end
 
@@ -149,11 +156,11 @@ let reconnect_service =
     ~meth:(Eliom_service.Get Eliom_parameter.unit)
     ()
 
-let serve server =
+let serve mailbox =
   Server_app.register
     ~service:gong_service
     (fun () () ->
-      Server.request_gong server >|=
+      Lwt_mvar.put mailbox Server.Ring >|=
       (fun _ ->
         (Eliom_tools.F.html
            ~title:"gong"
@@ -163,8 +170,10 @@ let serve server =
            ]))));
   Eliom_registration.Action.register
     ~service:reconnect_service
-    (fun () () -> Server.reconnect server)
+    (fun () () -> Lwt_mvar.put mailbox Server.Reconnect)
 
 let () =
-   Server.connect () >|= serve |> Lwt_main.run
+   let gong_server, mailbox = Server.create () in
+   Lwt.async gong_server;
+   serve mailbox
 
