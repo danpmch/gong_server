@@ -14,7 +14,7 @@ sig
    type t
 
    val connect : string -> t Lwt.t
-   val reconnect : t -> unit Lwt.t
+   val reconnect : t -> t Lwt.t
 
    val ring : t -> unit Lwt.t
 end
@@ -29,32 +29,23 @@ struct
    (* the channel is stored in a ref to simplify reconnecting
     * after the arduino is unplugged or the test file is deleted *)
    type t = { filename: string
-            ; file: Lwt_io.output Lwt_io.channel ref }
+            ; file: Lwt_io.output Lwt_io.channel }
 
    let open_file filename =
      Lwt_io.open_file Lwt_io.Output filename
 
    let connect filename = 
      open_file filename >|=
-        (fun file -> { filename = filename; file = ref file })
+        (fun file -> { filename = filename; file = file })
 
    let reconnect gong =
-      let old_file = !(gong.file) in
-      open_file gong.filename >|=
-      (* I believe there's a race condition here. If two
-       * threads are opening a new file simultaneously
-       * then whichever one finishes last will throw away
-       * the first thread's file without closing it.
-       *
-       * Should either use a mutex or figure out if
-       * Ocaml/Lwt has a better technique.
-       * *)
-      (fun file -> gong.file := file) >>=
-      (fun _ -> Lwt_io.close old_file)
+      Lwt_io.close gong.file >>=
+      (fun _ -> open_file gong.filename) >|=
+      (fun file -> { filename = gong.filename; file = file })
 
    let ring gong : unit Lwt.t =
-     Lwt_io.write_char !(gong.file) 'g' >>=
-     (fun _ -> Lwt_io.flush !(gong.file))
+     Lwt_io.write_char gong.file 'g' >>=
+     (fun _ -> Lwt_io.flush gong.file)
 
 end
 
@@ -112,7 +103,8 @@ struct
                | Reconnect ->
                   Lwt_io.printl "Reconnecting to gong..." >>=
                   (wait_for_connection (fun _ -> Gong.reconnect server.gong) "") >|=
-                  (fun _ -> server)
+                  (fun gong ->
+                     { gong = gong; mailbox = server.mailbox })
                | Connect filename ->
                   Lwt_io.printl "Connecting to new gong..." >>=
                   wait_for_connection Gong.connect filename >|=
