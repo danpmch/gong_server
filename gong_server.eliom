@@ -34,27 +34,36 @@ let gong_service =
 
 let gong arduino =
   try
+    print_endline "Processing gong request";
     BatIO.write arduino 'g';
     BatIO.flush arduino;
-    true
+    ()
   with
-  | _ -> false
+  | _ -> ()
+
+let request_gong arduino =
+   Lwt_mvar.put arduino ()
 
 let serve arduino =
   Server_app.register
     ~service:gong_service
     (fun () () ->
-      let message =
-        if gong arduino then "gong!"
-        else "could not ring gong" in
-      Lwt.return
+      request_gong arduino >|=
+      (fun _ ->
         (Eliom_tools.F.html
            ~title:"gong"
            ~css:[["css";"server.css"]]
            Html.F.(body [
-             h1 [pcdata message];
-           ])))
+             h1 [pcdata "gong!"];
+           ]))))
+
+let rec process_requests mailbox arduino =
+   Lwt_mvar.take mailbox >|=
+    (fun _ -> gong arduino) >>=
+    (fun _ -> process_requests mailbox arduino)
 
 let () =
-  Lwt_main.run (connect_arduino () >|= serve)
+  let mailbox = Lwt_mvar.create_empty () in
+  Lwt.async (fun () -> connect_arduino () >>= process_requests mailbox);
+  serve mailbox
 
