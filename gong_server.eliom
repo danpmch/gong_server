@@ -79,6 +79,7 @@ module GongServer(Gong : GONG) =
 struct
    type request = Ring
                 | Reconnect
+                | Connect of string
 
    type t = { gong: Gong.t
             ; mailbox: request Lwt_mvar.t }
@@ -103,13 +104,21 @@ struct
       * requests out of the mailbox and actually
       * ringing the gong. It is intended to be run in
       * a separate asynchronous thread *)
-   let rec process_requests server () =
+   let rec process_requests server =
       Lwt_mvar.take server.mailbox >>=
-       (function Ring -> gong server
+       (function Ring ->
+                  gong server >|=
+                  (fun _ -> server)
                | Reconnect ->
                   Lwt_io.printl "Reconnecting to gong..." >>=
-                  (wait_for_connection (fun _ -> Gong.reconnect server.gong) "")) >>=
-       (process_requests server)
+                  (wait_for_connection (fun _ -> Gong.reconnect server.gong) "") >|=
+                  (fun _ -> server)
+               | Connect filename ->
+                  Lwt_io.printl "Connecting to new gong..." >>=
+                  wait_for_connection Gong.connect filename >|=
+                  (fun gong ->
+                    { gong = gong; mailbox = server.mailbox })) >>=
+       process_requests
 
    let create filename : (unit -> unit Lwt.t) * request Lwt_mvar.t  =
       let mailbox = Lwt_mvar.create_empty () in
@@ -119,7 +128,7 @@ struct
            let server = { gong = gong;
               mailbox = mailbox } in
            (* launch the request handling thread *)
-           Lwt.async (process_requests server)) in
+           Lwt.async (fun () -> process_requests server)) in
       (server_task, mailbox)
 
    (* this is the function called in response to 
@@ -148,6 +157,12 @@ let gong_service =
     ~meth:(Eliom_service.Get Eliom_parameter.unit)
     ()
 
+let connect_service =
+   Eliom_service.create
+   ~path:(Eliom_service.Path ["connect"])
+   ~meth:(Eliom_service.Get (Eliom_parameter.string "filename"))
+   ()
+
 let reconnect_service =
   Eliom_service.create
     ~path:(Eliom_service.Path ["reconnect"])
@@ -166,6 +181,11 @@ let serve mailbox =
            Html.F.(body [
              h1 [pcdata "gong!"];
            ]))));
+  Eliom_registration.Action.register
+    ~service:connect_service
+    (fun filename () ->
+       Lwt_io.printlf "Attempting to connect to %s" filename >>=
+       (fun _ -> Lwt_mvar.put mailbox (Server.Connect filename)));
   Eliom_registration.Action.register
     ~service:reconnect_service
     (fun () () -> Lwt_mvar.put mailbox Server.Reconnect)
