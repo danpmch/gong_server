@@ -155,11 +155,34 @@ let connect_service =
    ~meth:(Eliom_service.Get (Eliom_parameter.string "filename"))
    ()
 
+let list_service =
+   Eliom_service.create
+   ~path:(Eliom_service.Path ["list"])
+   ~meth:(Eliom_service.Get Eliom_parameter.unit)
+   ()
+
 let reconnect_service =
   Eliom_service.create
     ~path:(Eliom_service.Path ["reconnect"])
     ~meth:(Eliom_service.Get Eliom_parameter.unit)
     ()
+
+let device_regex = Str.regexp "ttyACM.*"
+let is_device filename =
+   try
+      let _ = Str.search_forward device_regex filename 0 in
+      true
+   with
+   | _ -> false
+
+let full_path arduino = "/dev/" ^ arduino
+
+let list_arduinos : string list Lwt.t =
+   let dir = Lwt_unix.opendir "/dev" in
+   let entry_array = dir >>= (fun d -> Lwt_unix.readdir_n d 500) in
+   let entries = entry_array >|= (fun es -> Array.enum es |> List.of_enum) in
+   let arduinos  = entries >|= (List.filter is_device) in
+   arduinos
 
 let serve mailbox =
   Server_app.register
@@ -173,17 +196,39 @@ let serve mailbox =
            Html.F.(body [
              h1 [pcdata "gong!"];
            ]))));
+
   Eliom_registration.Action.register
     ~service:connect_service
     (fun filename () ->
        Lwt_io.printlf "Attempting to connect to %s" filename >>=
        (fun _ -> Lwt_mvar.put mailbox (Server.Connect filename)));
+
+  Server_app.register
+     ~service:list_service
+     (fun () () ->
+       list_arduinos >|=
+       (fun arduinos ->
+        (Eliom_tools.F.html
+           ~title:"gong"
+           ~css:[["css";"server.css"]]
+           Html.F.(body [
+             h1 [pcdata "Available Arduinos:"];
+             ul (List.map
+                   (fun arduino ->
+                      li [a ~service:connect_service [pcdata arduino] (full_path arduino)] )
+                   arduinos)
+           ]))
+     ));
   Eliom_registration.Action.register
     ~service:reconnect_service
     (fun () () -> Lwt_mvar.put mailbox Server.Reconnect)
 
 let () =
-   let gong_server, mailbox = Server.create "/dev/ttyACM0" in
-   Lwt.async gong_server;
-   serve mailbox
+   let task = list_arduinos >|=
+      (fun arduinos ->
+         let arduino = List.Exceptionless.hd arduinos |> Option.default "ttyACM0" in
+         let gong_server, mailbox = Server.create (full_path arduino) in
+         Lwt.async gong_server;
+         serve mailbox) in
+   Lwt_main.run task
 
