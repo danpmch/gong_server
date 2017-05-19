@@ -69,10 +69,9 @@ end
 module GongServer(Gong : GONG) =
 struct
    type request = Ring
-                | Reconnect
                 | Connect of string
 
-   type t = { gong: Gong.t
+   type t = { gong: Gong.t option
             ; mailbox: request Lwt_mvar.t }
 
    let rec wait_for_connection (connect_fn: string -> 'a Lwt.t) filename () =
@@ -81,15 +80,18 @@ struct
           connect_fn filename >>=
           (fun gong ->
             Lwt_io.printl "Connected to gong!" >|=
-            (fun _ -> gong)))
+            (fun _ -> Some gong)))
        (fun _ ->
-         Lwt_io.printl "Could not connect to gong, retrying..." >>=
-         (fun _ -> Lwt_unix.sleep 5.0) >>=
-         wait_for_connection connect_fn filename)
+         Lwt_io.printl "Could not connect to gong, aborting..." >|=
+         (fun _ -> None))
 
-   let gong server : unit Lwt.t =
-     Lwt_io.printl "Processing gong request" >>=
-     (fun _ -> Gong.ring server.gong)
+   let handle_ring server : unit Lwt.t =
+     match server.gong with
+     | Some gong ->
+         Lwt_io.printl "Processing gong request" >>=
+         (fun _ -> Gong.ring gong)
+     | None ->
+         Lwt_io.printl "No gong available for ring request"
 
      (* This function is responsible for pulling
       * requests out of the mailbox and actually
@@ -98,13 +100,8 @@ struct
    let rec process_requests server =
       Lwt_mvar.take server.mailbox >>=
        (function Ring ->
-                  gong server >|=
+                  handle_ring server >|=
                   (fun _ -> server)
-               | Reconnect ->
-                  Lwt_io.printl "Reconnecting to gong..." >>=
-                  (wait_for_connection (fun _ -> Gong.reconnect server.gong) "") >|=
-                  (fun gong ->
-                     { gong = gong; mailbox = server.mailbox })
                | Connect filename ->
                   Lwt_io.printl "Connecting to new gong..." >>=
                   wait_for_connection Gong.connect filename >|=
@@ -127,9 +124,6 @@ struct
     * http requests to the gong endpoint *)
    let request_gong server =
       Lwt_mvar.put server.mailbox Ring
-
-   let reconnect server : unit Lwt.t =
-      Lwt_mvar.put server.mailbox Reconnect
 
 end
 
@@ -161,12 +155,6 @@ let list_service =
    ~meth:(Eliom_service.Get Eliom_parameter.unit)
    ()
 
-let reconnect_service =
-  Eliom_service.create
-    ~path:(Eliom_service.Path ["reconnect"])
-    ~meth:(Eliom_service.Get Eliom_parameter.unit)
-    ()
-
 let device_regex = Str.regexp "ttyACM.*"
 let is_device filename =
    try
@@ -177,7 +165,7 @@ let is_device filename =
 
 let full_path arduino = "/dev/" ^ arduino
 
-let list_arduinos : string list Lwt.t =
+let list_arduinos () : string list Lwt.t =
    let dir = Lwt_unix.opendir "/dev" in
    let entry_array = dir >>= (fun d -> Lwt_unix.readdir_n d 500) in
    let entries = entry_array >|= (fun es -> Array.enum es |> List.of_enum) in
@@ -206,6 +194,7 @@ let serve mailbox =
   Server_app.register
      ~service:list_service
      (fun () () ->
+       Lwt_io.printl "Listing arduinos" >>=
        list_arduinos >|=
        (fun arduinos ->
         (Eliom_tools.F.html
@@ -218,13 +207,10 @@ let serve mailbox =
                       li [a ~service:connect_service [pcdata arduino] (full_path arduino)] )
                    arduinos)
            ]))
-     ));
-  Eliom_registration.Action.register
-    ~service:reconnect_service
-    (fun () () -> Lwt_mvar.put mailbox Server.Reconnect)
+     ))
 
 let () =
-   let task = list_arduinos >|=
+   let task = list_arduinos () >|=
       (fun arduinos ->
          let arduino = List.Exceptionless.hd arduinos |> Option.default "ttyACM0" in
          let gong_server, mailbox = Server.create (full_path arduino) in
